@@ -320,8 +320,14 @@ func (f *IDP) token(w http.ResponseWriter, r *http.Request) {
 		"iat": now.Unix(), "nonce": g.nonce, "email": g.user.Email, "email_verified": g.user.EmailVerified, "name": g.user.Name,
 	}
 	maps.Copy(claims, f.Claims)
-	out := f.issue(g, r.PostFormValue("resource"))
-	out["id_token"] = f.sign(claims)
+	out, err := f.issue(g, r.PostFormValue("resource"))
+	if err == nil {
+		out["id_token"], err = f.signTypedLocked("JWT", claims)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, out)
 }
 
@@ -335,10 +341,15 @@ func (f *IDP) refreshGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.resources.Refresh = r.PostFormValue("resource")
-	writeJSON(w, f.issue(g, r.PostFormValue("resource")))
+	out, err := f.issue(g, r.PostFormValue("resource"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, out)
 }
 
-func (f *IDP) issue(g grant, resource string) map[string]any {
+func (f *IDP) issue(g grant, resource string) (map[string]any, error) {
 	claims := map[string]any{"sub": g.user.Subject, "client_id": g.clientID, "scope": g.scope}
 	if resource != "" {
 		claims["aud"] = resource
@@ -346,44 +357,44 @@ func (f *IDP) issue(g grant, resource string) map[string]any {
 	base := map[string]any{
 		"iss": f.Issuer(), "iat": f.Now().Unix(), "exp": f.Now().Add(accessTokenTTL).Unix(), "jti": rand.Text(),
 	}
+	access, err := f.signTypedLocked("at+jwt", merge(base, claims))
+	if err != nil {
+		return nil, err
+	}
 	refresh := rand.Text()
 	f.refresh[refresh] = g
 	return map[string]any{
-		"access_token": f.signTypedLocked("at+jwt", merge(base, claims)), "token_type": "Bearer", "refresh_token": refresh,
+		"access_token": access, "token_type": "Bearer", "refresh_token": refresh,
 		"expires_in": int(accessTokenTTL / time.Second), "scope": g.scope,
-	}
-}
-
-func (f *IDP) sign(claims map[string]any) string {
-	return f.signTypedLocked("JWT", claims)
+	}, nil
 }
 
 func (f *IDP) signTyped(typ string, claims map[string]any) string {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.signTypedLocked(typ, claims)
-}
-
-func (f *IDP) signTypedLocked(typ string, claims map[string]any) string {
-	k := f.keys[len(f.keys)-1]
-	opts := (&jose.SignerOptions{}).WithType(jose.ContentType(strings.TrimSpace(typ))).WithHeader("kid", k.kid)
-	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: k.key}, opts)
-	if err != nil {
-		f.fatal(err)
-	}
-	payload, err := json.Marshal(claims)
-	if err != nil {
-		f.fatal(err)
-	}
-	obj, err := signer.Sign(payload)
-	if err != nil {
-		f.fatal(err)
-	}
-	out, err := obj.CompactSerialize()
+	out, err := f.signTypedLocked(typ, claims)
+	f.mu.Unlock()
 	if err != nil {
 		f.fatal(err)
 	}
 	return out
+}
+
+func (f *IDP) signTypedLocked(typ string, claims map[string]any) (string, error) {
+	k := f.keys[len(f.keys)-1]
+	opts := (&jose.SignerOptions{}).WithType(jose.ContentType(strings.TrimSpace(typ))).WithHeader("kid", k.kid)
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: k.key}, opts)
+	if err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	obj, err := signer.Sign(payload)
+	if err != nil {
+		return "", err
+	}
+	return obj.CompactSerialize()
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
