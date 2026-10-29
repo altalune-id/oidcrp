@@ -1,0 +1,118 @@
+version: "2"
+
+# Run locally: golangci-lint run (the version CI pins is in .github/workflows/ci.yml).
+
+run:
+  timeout: 3m
+  tests: true
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - depguard
+    - errorlint
+    - forbidigo
+    - gochecknoglobals
+    - gocritic
+    - gosec
+    - lll
+    - misspell
+    - modernize
+    - nilerr
+    - prealloc
+    - revive
+    - unconvert
+    - unparam
+    - whitespace
+
+  settings:
+    lll:
+      line-length: 140
+      tab-width: 1
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+      disabled-checks:
+        - ifElseChain
+        - hugeParam
+        - rangeValCopy
+    gosec:
+      excludes:
+        - G104    # duplicates errcheck
+        - G404    # weak random OK for non-crypto uses
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
+        - name: unexported-return
+          disabled: true   # constructors returning *unexported are our pattern
+        # A rules list replaces revive's defaults, so the defaults we want are listed.
+        - name: var-naming
+        - name: error-return
+        - name: error-naming
+        - name: error-strings
+        - name: dot-imports
+        - name: blank-imports
+        - name: context-as-argument
+          arguments:
+            - allowTypesBefore: "*testing.T"
+        - name: context-keys-type
+        - name: increment-decrement
+        - name: range
+        - name: receiver-naming
+        - name: superfluous-else
+        - name: unreachable-code
+        - name: redefines-builtin-id
+    forbidigo:
+      forbid:
+        - pattern: 'fmt\.Print(f|ln|)\('
+          msg: "use cmd.OutOrStdout() or slog for output"
+        - pattern: 'slog\.(Info|Warn|Error|Debug)Context\('
+          msg: "use an injected *slog.Logger, not the slog default"
+      exclude-godoc-examples: true
+      analyze-types: true
+    depguard:
+      rules:
+        library-boundary:
+          list-mode: lax
+          deny:
+            - pkg: "github.com/altalune-id/othra"
+              desc: "app libraries never import Othra: stdlib, go-jose and oidcrp only"
+
+  exclusions:
+    generated: strict
+    warn-unused: false
+    rules:
+      - path: _test\.go
+        linters:
+          - lll
+          - errcheck
+          - gochecknoglobals
+          - gocritic
+          - gosec
+          - prealloc
+          - unparam
+
+formatters:
+  enable:
+    - gofmt
+    - gci
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - localmodule
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
