@@ -25,4 +25,4 @@ It returns a `TokenSet`; `Refresh` renews it (RFC 6749 Section 6) and `Revoke` r
 
 `oidcrptest` starts an in-memory OpenID provider for tests. See `example_test.go`.
 
-Dependencies: the standard library and go-jose. Licensed under Apache-2.0 (see `LICENSE` and `NOTICE`).
+Dependencies: the standard library, golang.org/x/sync and go-jose. Licensed under Apache-2.0 (see `LICENSE` and `NOTICE`).

@@ -38,7 +38,8 @@ func NewKeySource(issuer string, httpClient *http.Client) *KeySource {
 	}
 	return &KeySource{
 		issuer: issuer, http: httpClient, now: time.Now,
-		meta: &cache[Metadata]{policy: metadataPolicy}, keys: &cache[jose.JSONWebKeySet]{policy: jwksPolicy},
+		meta: &cache[Metadata]{policy: metadataPolicy, timeout: httpClient.Timeout},
+		keys: &cache[jose.JSONWebKeySet]{policy: jwksPolicy, timeout: httpClient.Timeout},
 	}
 }
 
@@ -56,7 +57,7 @@ func (s *KeySource) HTTPClient() *http.Client { return s.http }
 
 // Metadata returns the issuer's discovery document, cached by its Cache-Control.
 func (s *KeySource) Metadata(ctx context.Context) (*Metadata, error) {
-	return s.meta.get(ctx, s.now(), false, s.fetchMetadata)
+	return s.meta.get(ctx, s.now, false, s.fetchMetadata)
 }
 
 // SECURITY: OIDC Discovery §4.3, the document must name the configured issuer exactly, or it describes another upstream IdP.
@@ -90,7 +91,7 @@ func (s *KeySource) Key(ctx context.Context, kid string) (*jose.JSONWebKey, erro
 		return s.fetchKeys(ctx, meta.JWKSURI)
 	}
 	now := s.now()
-	set, err := s.keys.get(ctx, now, false, fetch)
+	set, err := s.keys.get(ctx, s.now, false, fetch)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +107,7 @@ func (s *KeySource) Key(ctx context.Context, kid string) (*jose.JSONWebKey, erro
 	if limited {
 		return nil, &Error{Reason: ReasonIDToken, Err: errors.New("unknown kid")}
 	}
-	if set, err = s.keys.get(ctx, now, true, fetch); err != nil {
+	if set, err = s.keys.get(ctx, s.now, true, fetch); err != nil {
 		return nil, err
 	}
 	if k := find(set, kid); k != nil {
