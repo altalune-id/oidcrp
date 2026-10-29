@@ -20,6 +20,8 @@ authURL, _ := c.AuthCodeURL(ctx, req)
 tok, err := c.Exchange(ctx, oidcrp.ParseCallback(r.URL.Query()), req)
 ```
 
+For a CLI, `RunLoopback` signs a native client in through a loopback redirect (RFC 8252): register `http://127.0.0.1/callback` and it picks the port at run time. `OpenBrowser` opens the authorization URL.
+
 `oidcrptest` starts an in-memory OpenID provider for tests. See `example_test.go`.
 
 Dependencies: the standard library and go-jose. Licensed under Apache-2.0 (see `LICENSE` and `NOTICE`).
