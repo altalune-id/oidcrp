@@ -23,7 +23,7 @@ type tokenResponse struct {
 	IDToken      string          `json:"id_token"`
 }
 
-// Refresh renews prev through its refresh token (RFC 6749 Section 6); on an error with a non-nil set, store set.RefreshToken, the rotated one.
+// Refresh renews prev (RFC 6749 Section 6); an error with a non-nil set still carries the rotated RefreshToken to store.
 func (c *Client) Refresh(ctx context.Context, prev TokenSet) (*TokenSet, error) {
 	if prev.RefreshToken == "" {
 		return nil, &Error{Reason: ReasonTokenExchange, Err: errors.New("no refresh token")}
