@@ -74,7 +74,7 @@ func (s *KeySource) fetchMetadata(ctx context.Context) (*Metadata, http.Header, 
 	case meta.Issuer != s.issuer:
 		return nil, nil, &Error{Reason: ReasonMisconfigured, Err: errors.New("the discovery issuer does not match")}
 	case !sameScheme(s.issuer, meta.AuthorizationEndpoint, meta.TokenEndpoint, meta.JWKSURI),
-		!optionalSameScheme(s.issuer, meta.EndSessionEndpoint, meta.IntrospectionEndpoint):
+		!optionalSameScheme(s.issuer, meta.EndSessionEndpoint, meta.IntrospectionEndpoint, meta.RevocationEndpoint):
 		return nil, nil, &Error{Reason: ReasonDiscovery, Err: errors.New("an endpoint is missing or not on the issuer's scheme")}
 	}
 	return &meta, h, nil
@@ -138,29 +138,37 @@ func find(set *jose.JSONWebKeySet, kid string) *jose.JSONWebKey {
 }
 
 func (s *KeySource) doJSON(r *http.Request, reason Reason, dst any) (http.Header, error) {
+	h, body, err := s.do(r, reason)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(body, dst); err != nil {
+		return nil, &Error{Reason: reason, Err: err}
+	}
+	return h, nil
+}
+
+func (s *KeySource) do(r *http.Request, reason Reason) (http.Header, []byte, error) {
 	resp, err := s.http.Do(r)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
 			reason = ReasonTimeout
 		}
-		return nil, &Error{Reason: reason, Err: err}
+		return nil, nil, &Error{Reason: reason, Err: err}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	switch {
 	case err != nil:
-		return nil, &Error{Reason: reason, Err: err}
+		return nil, nil, &Error{Reason: reason, Err: err}
 	case resp.StatusCode != http.StatusOK:
 		code := oauthError(resp.StatusCode, body)
-		return nil, &Error{Reason: reason, OAuthError: code, Err: fmt.Errorf("status %d", resp.StatusCode)}
+		return nil, nil, &Error{Reason: reason, OAuthError: code, Err: fmt.Errorf("status %d", resp.StatusCode)}
 	}
-	if err := json.Unmarshal(body, dst); err != nil {
-		return nil, &Error{Reason: reason, Err: err}
-	}
-	return resp.Header, nil
+	return resp.Header, body, nil
 }
 
-// NOTE: RFC 6749 §5.2 codes plus RFC 8707's invalid_target (https://www.rfc-editor.org/rfc/rfc6749#section-5.2).
+// NOTE: RFC 6749 §5.2 codes plus RFC 8707's invalid_target and RFC 7009 §2.2.1's unsupported_token_type.
 func oauthError(status int, body []byte) string {
 	if status != http.StatusBadRequest && status != http.StatusUnauthorized {
 		return ""
@@ -173,7 +181,7 @@ func oauthError(status int, body []byte) string {
 	}
 	switch out.Error {
 	case "invalid_request", "invalid_client", "invalid_grant", "unauthorized_client",
-		"unsupported_grant_type", "invalid_scope", "invalid_target":
+		"unsupported_grant_type", "invalid_scope", "invalid_target", "unsupported_token_type":
 		return out.Error
 	}
 	return "other"

@@ -51,7 +51,7 @@ func TestRunLoopback_SignsIn(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, idp.User.Subject, tok.Subject)
+	assert.Equal(t, idp.User.Subject, tok.IDToken.Subject)
 	assert.Contains(t, page, "Sign-in received")
 
 	q := mustQuery(t, authURL)
@@ -62,6 +62,8 @@ func TestRunLoopback_SignsIn(t *testing.T) {
 	assert.Equal(t, "/callback", redirect.Path)
 	assert.Equal(t, "S256", q.Get("code_challenge_method"), "RFC 8252 §8.1: native clients use PKCE")
 	assert.Equal(t, "ana@gmail.com", q.Get("login_hint"))
+	assert.False(t, q.Has("resource"), "RFC 8707 §2: no Resource, no resource parameter")
+	assert.Equal(t, oidcrptest.Resources{}, idp.Resources())
 }
 
 func TestRunLoopback_FixedPortAndIPv6(t *testing.T) {
@@ -112,7 +114,7 @@ func TestRunLoopback_IgnoresStrayRequests(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, idp.User.Subject, tok.Subject)
+	assert.Equal(t, idp.User.Subject, tok.IDToken.Subject)
 }
 
 func TestRunLoopback_Denied(t *testing.T) {

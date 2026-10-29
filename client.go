@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 	"slices"
 	"strings"
@@ -111,6 +110,9 @@ func (c *Client) AuthCodeURL(ctx context.Context, req AuthRequest) (string, erro
 	if req.LoginHint != "" {
 		q.Set("login_hint", req.LoginHint)
 	}
+	if c.cfg.Resource != "" {
+		q.Set("resource", c.cfg.Resource)
+	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil
 }
@@ -124,32 +126,41 @@ func ParseCallback(q url.Values) Callback {
 
 // Exchange checks the callback against req, redeems the code and returns the validated ID token; the upstream IdP's tokens are dropped.
 func (c *Client) Exchange(ctx context.Context, cb Callback, req AuthRequest) (*IDToken, error) {
+	_, tok, err := c.exchange(ctx, cb, req)
+	return tok, err
+}
+
+func (c *Client) exchange(ctx context.Context, cb Callback, req AuthRequest) (*tokenResponse, *IDToken, error) {
 	if req.State == "" || subtle.ConstantTimeCompare([]byte(cb.State), []byte(req.State)) != 1 {
-		return nil, &Error{Reason: ReasonState, Err: errors.New("state does not match")}
+		return nil, nil, &Error{Reason: ReasonState, Err: errors.New("state does not match")}
 	}
 	meta, err := c.src.Metadata(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// SECURITY: RFC 9207 §2.4: a present iss must name the upstream IdP, or it is a mix-up; a code needs iss when it is advertised.
 	// SECURITY: Google interop: Google omits iss on error responses; an error with no code and no iss has nothing to inject or steal.
 	missing := cb.Issuer == "" && meta.AuthorizationResponseISSParams && (cb.Code != "" || cb.Error == "")
 	if missing || cb.Issuer != "" && cb.Issuer != meta.Issuer {
-		return nil, &Error{Reason: ReasonIssuer, Err: errors.New("the authorization response iss does not match")}
+		return nil, nil, &Error{Reason: ReasonIssuer, Err: errors.New("the authorization response iss does not match")}
 	}
 	switch {
 	case cb.Error == "access_denied":
-		return nil, &Error{Reason: ReasonCancelled, Err: errors.New("access_denied")}
+		return nil, nil, &Error{Reason: ReasonCancelled, Err: errors.New("access_denied")}
 	case cb.Error != "":
-		return nil, &Error{Reason: ReasonError, Err: errors.New("the upstream IdP answered " + errorCode(cb.Error))}
+		return nil, nil, &Error{Reason: ReasonError, Err: errors.New("the upstream IdP answered " + errorCode(cb.Error))}
 	case cb.Code == "":
-		return nil, &Error{Reason: ReasonState, Err: errors.New("no code")}
+		return nil, nil, &Error{Reason: ReasonState, Err: errors.New("no code")}
 	}
-	raw, err := c.redeem(ctx, meta, cb.Code, req.CodeVerifier)
+	out, err := c.redeem(ctx, meta, cb.Code, req.CodeVerifier)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return c.verify(ctx, meta, raw, req.Nonce)
+	tok, err := c.verify(ctx, meta, out.IDToken, req.Nonce)
+	if err != nil {
+		return nil, nil, err
+	}
+	return out, tok, nil
 }
 
 // NOTE: the error parameter is attacker-controlled and unbounded, so only a registered code reaches a log line.
@@ -160,36 +171,18 @@ func errorCode(code string) string {
 	return "other"
 }
 
-func (c *Client) redeem(ctx context.Context, meta *Metadata, code, verifier string) (string, error) {
+func (c *Client) redeem(ctx context.Context, meta *Metadata, code, verifier string) (*tokenResponse, error) {
 	form := url.Values{
 		"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {c.cfg.RedirectURI}, "code_verifier": {verifier},
 	}
-	if c.cfg.ClientSecret == "" {
-		form.Set("client_id", c.cfg.ClientID)
-	}
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, meta.TokenEndpoint, strings.NewReader(form.Encode()))
+	out, err := c.grant(ctx, meta, form)
 	if err != nil {
-		return "", &Error{Reason: ReasonTokenExchange, Err: err}
+		return nil, err
 	}
-	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.Header.Set("Accept", "application/json")
-	if c.cfg.ClientSecret != "" {
-		r.SetBasicAuth(url.QueryEscape(c.cfg.ClientID), url.QueryEscape(c.cfg.ClientSecret))
+	if out.IDToken == "" {
+		return nil, &Error{Reason: ReasonTokenExchange, Err: errors.New("the token response has no id_token")}
 	}
-	var out struct {
-		IDToken   string `json:"id_token"`
-		TokenType string `json:"token_type"`
-	}
-	if _, err := c.src.doJSON(r, ReasonTokenExchange, &out); err != nil {
-		return "", err
-	}
-	switch {
-	case !strings.EqualFold(strings.TrimSpace(out.TokenType), "Bearer"):
-		return "", &Error{Reason: ReasonTokenExchange, Err: errors.New("the token type is not Bearer")}
-	case out.IDToken == "":
-		return "", &Error{Reason: ReasonTokenExchange, Err: errors.New("the token response has no id_token")}
-	}
-	return out.IDToken, nil
+	return out, nil
 }
 
 // IsAccessTokenType reports whether a JWS header's typ is RFC 9068's at+jwt or application/at+jwt, compared case-insensitively.

@@ -26,7 +26,7 @@ type User struct {
 	Name          string
 }
 
-// IDP is a fake OpenID Provider: discovery, JWKS, a token endpoint that redeems the codes Authorize hands out, and RFC 7662 introspection.
+// IDP is a fake OpenID Provider: discovery, JWKS, code and refresh grants, RFC 7662 introspection and RFC 7009 revocation.
 type IDP struct {
 	srv  *httptest.Server
 	keys []signingKey
@@ -34,9 +34,12 @@ type IDP struct {
 
 	mu             sync.Mutex
 	codes          map[string]grant
+	refresh        map[string]grant
 	opaque         map[string]map[string]any
 	introspector   [2]string
 	introspections int
+	revocations    int
+	resources      Resources
 	// User is who the next Authorize signs in.
 	User User
 	// Claims are merged over the ID token's claims, so a test can break one.
@@ -55,8 +58,18 @@ type signingKey struct {
 type grant struct {
 	nonce    string
 	clientID string
+	scope    string
 	user     User
 }
+
+// Resources are the last RFC 8707 resource values the upstream IdP received.
+type Resources struct {
+	Authorize string
+	Code      string
+	Refresh   string
+}
+
+const accessTokenTTL = 15 * time.Minute
 
 // New starts a fake upstream IdP that closes with t.
 func New(t testing.TB) *IDP {
@@ -74,7 +87,7 @@ func (f *IDP) Close() { f.srv.Close() }
 
 func start(t testing.TB) *IDP {
 	f := &IDP{
-		t: t, codes: map[string]grant{}, opaque: map[string]map[string]any{}, Now: time.Now,
+		t: t, codes: map[string]grant{}, refresh: map[string]grant{}, opaque: map[string]map[string]any{}, Now: time.Now,
 		User: User{Subject: "110169484474386276334", Email: "ana@gmail.com", EmailVerified: true, Name: "Ana"},
 	}
 	f.RotateKey()
@@ -83,6 +96,7 @@ func start(t testing.TB) *IDP {
 	mux.HandleFunc("GET /jwks", f.jwks)
 	mux.HandleFunc("POST /token", f.token)
 	mux.HandleFunc("POST /introspect", f.introspect)
+	mux.HandleFunc("POST /revoke", f.revoke)
 	f.srv = httptest.NewTLSServer(mux)
 	return f
 }
@@ -113,7 +127,8 @@ func (f *IDP) Authorize(authURL string) url.Values {
 	q := u.Query()
 	code := rand.Text()
 	f.mu.Lock()
-	f.codes[code] = grant{nonce: q.Get("nonce"), clientID: q.Get("client_id"), user: f.User}
+	f.codes[code] = grant{nonce: q.Get("nonce"), clientID: q.Get("client_id"), scope: q.Get("scope"), user: f.User}
+	f.resources.Authorize = q.Get("resource")
 	f.mu.Unlock()
 	return url.Values{"code": {code}, "state": {q.Get("state")}, "iss": {f.Issuer()}}
 }
@@ -129,7 +144,7 @@ func (f *IDP) discovery(w http.ResponseWriter, _ *http.Request) {
 		"issuer": f.Issuer(), "authorization_endpoint": f.Issuer() + "/authorize", "token_endpoint": f.Issuer() + "/token",
 		"jwks_uri": f.Issuer() + "/jwks", "code_challenge_methods_supported": []string{"S256"},
 		"authorization_response_iss_parameter_supported": true, "id_token_signing_alg_values_supported": []string{"RS256"},
-		"introspection_endpoint": f.Issuer() + "/introspect",
+		"introspection_endpoint": f.Issuer() + "/introspect", "revocation_endpoint": f.Issuer() + "/revoke",
 	})
 }
 
@@ -163,7 +178,7 @@ func (f *IDP) AccessToken(claims map[string]any) string {
 func (f *IDP) AccessTokenClaims(claims map[string]any) map[string]any {
 	now := f.Now()
 	base := map[string]any{
-		"iss": f.Issuer(), "sub": f.User.Subject, "client_id": "test-client", "iat": now.Unix(), "exp": now.Add(15 * time.Minute).Unix(),
+		"iss": f.Issuer(), "sub": f.User.Subject, "client_id": "test-client", "iat": now.Unix(), "exp": now.Add(accessTokenTTL).Unix(),
 		"jti": rand.Text(), "scope": "openid",
 	}
 	return merge(base, claims)
@@ -221,6 +236,28 @@ func (f *IDP) introspect(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, merge(map[string]any{"active": true, "iss": f.Issuer(), "token_type": "Bearer"}, claims))
 }
 
+// Resources returns the last resource sent on the authorization, code and refresh requests.
+func (f *IDP) Resources() Resources {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resources
+}
+
+// Revocations counts the requests to the revocation endpoint.
+func (f *IDP) Revocations() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.revocations
+}
+
+func (f *IDP) revoke(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revocations++
+	delete(f.refresh, r.PostFormValue("token"))
+	w.WriteHeader(http.StatusOK)
+}
+
 func merge(base, over map[string]any) map[string]any {
 	for k, v := range over {
 		if v == nil {
@@ -235,6 +272,10 @@ func merge(base, over map[string]any) map[string]any {
 func (f *IDP) token(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if r.PostFormValue("grant_type") == "refresh_token" {
+		f.refreshGrant(w, r)
+		return
+	}
 	g, ok := f.codes[r.PostFormValue("code")]
 	delete(f.codes, r.PostFormValue("code"))
 	if f.TokenStatus != 0 || !ok || r.PostFormValue("code_verifier") == "" {
@@ -242,13 +283,45 @@ func (f *IDP) token(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"error": "invalid_grant"})
 		return
 	}
+	f.resources.Code = r.PostFormValue("resource")
 	now := f.Now()
 	claims := map[string]any{
 		"iss": f.Issuer(), "sub": g.user.Subject, "aud": g.clientID, "azp": g.clientID, "exp": now.Add(time.Hour).Unix(),
 		"iat": now.Unix(), "nonce": g.nonce, "email": g.user.Email, "email_verified": g.user.EmailVerified, "name": g.user.Name,
 	}
 	maps.Copy(claims, f.Claims)
-	writeJSON(w, map[string]any{"access_token": "upstream-at", "token_type": "Bearer", "id_token": f.sign(claims)})
+	out := f.issue(g, r.PostFormValue("resource"))
+	out["id_token"] = f.sign(claims)
+	writeJSON(w, out)
+}
+
+// NOTE: RFC 9700 §4.14.2: a refresh token is rotated on use, so a reused one answers invalid_grant.
+func (f *IDP) refreshGrant(w http.ResponseWriter, r *http.Request) {
+	g, ok := f.refresh[r.PostFormValue("refresh_token")]
+	delete(f.refresh, r.PostFormValue("refresh_token"))
+	if f.TokenStatus != 0 || !ok {
+		w.WriteHeader(max(f.TokenStatus, http.StatusBadRequest))
+		writeJSON(w, map[string]string{"error": "invalid_grant"})
+		return
+	}
+	f.resources.Refresh = r.PostFormValue("resource")
+	writeJSON(w, f.issue(g, r.PostFormValue("resource")))
+}
+
+func (f *IDP) issue(g grant, resource string) map[string]any {
+	claims := map[string]any{"sub": g.user.Subject, "client_id": g.clientID, "scope": g.scope}
+	if resource != "" {
+		claims["aud"] = resource
+	}
+	base := map[string]any{
+		"iss": f.Issuer(), "iat": f.Now().Unix(), "exp": f.Now().Add(accessTokenTTL).Unix(), "jti": rand.Text(),
+	}
+	refresh := rand.Text()
+	f.refresh[refresh] = g
+	return map[string]any{
+		"access_token": f.signTypedLocked("at+jwt", merge(base, claims)), "token_type": "Bearer", "refresh_token": refresh,
+		"expires_in": int(accessTokenTTL / time.Second), "scope": g.scope,
+	}
 }
 
 func (f *IDP) sign(claims map[string]any) string {

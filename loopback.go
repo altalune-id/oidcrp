@@ -30,8 +30,8 @@ type LoopbackConfig struct {
 }
 
 // RunLoopback signs a native client in through a loopback redirect (RFC 8252 §7.3) on Config.RedirectURI, registered with no port
-// such as http://127.0.0.1/callback, and returns the validated ID token once one callback arrives or ctx ends.
-func (c *Client) RunLoopback(ctx context.Context, lc LoopbackConfig) (*IDToken, error) {
+// such as http://127.0.0.1/callback, and returns the validated tokens once one callback arrives or ctx ends.
+func (c *Client) RunLoopback(ctx context.Context, lc LoopbackConfig) (*TokenSet, error) {
 	if lc.Open == nil {
 		return nil, &Error{Reason: ReasonMisconfigured, Err: errors.New("LoopbackConfig.Open is required")}
 	}
@@ -78,7 +78,16 @@ func (c *Client) RunLoopback(ctx context.Context, lc LoopbackConfig) (*IDToken, 
 	}
 	select {
 	case cb := <-got:
-		return run.Exchange(ctx, cb, req)
+		out, tok, err := run.exchange(ctx, cb, req)
+		if err != nil {
+			return nil, err
+		}
+		set, err := run.tokenSet(out)
+		if err != nil {
+			return nil, err
+		}
+		set.IDToken = tok
+		return set, nil
 	case <-ctx.Done():
 		return nil, &Error{Reason: ReasonTimeout, Err: ctx.Err()}
 	}
