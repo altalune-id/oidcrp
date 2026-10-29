@@ -49,6 +49,9 @@ type fakeIDP struct {
 	tokType  string
 	endSess  string
 	lastID   string
+	extra    map[string]any
+	revoke   bool
+	revCode  int
 }
 
 func newFakeIDP(t *testing.T) *fakeIDP {
@@ -76,7 +79,7 @@ func newFakeIDP(t *testing.T) *fakeIDP {
 			"issuer": iss, "authorization_endpoint": f.srv.URL + "/authorize", "token_endpoint": f.srv.URL + "/token",
 			"jwks_uri": f.srv.URL + "/jwks", "code_challenge_methods_supported": methods,
 			"authorization_response_iss_parameter_supported": true, "id_token_signing_alg_values_supported": f.algs,
-			"end_session_endpoint": f.endSess,
+			"end_session_endpoint": f.endSess, "revocation_endpoint": f.revocationEndpoint(),
 		})
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
@@ -116,11 +119,34 @@ func newFakeIDP(t *testing.T) *fakeIDP {
 			f.lastID = f.sign()
 			out["id_token"] = f.lastID
 		}
+		for k, v := range f.extra {
+			if v == nil {
+				delete(out, k)
+				continue
+			}
+			out[k] = v
+		}
 		_ = json.NewEncoder(w).Encode(out)
+	})
+	mux.HandleFunc("/revoke", func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		f.form = r.PostForm
+		f.user, f.pass, f.basic = r.BasicAuth()
+		if f.revCode != 0 {
+			w.WriteHeader(f.revCode)
+			_, _ = w.Write([]byte(f.errBody))
+		}
 	})
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
+}
+
+func (f *fakeIDP) revocationEndpoint() string {
+	if !f.revoke {
+		return ""
+	}
+	return f.srv.URL + "/revoke"
 }
 
 func (f *fakeIDP) sign() string {

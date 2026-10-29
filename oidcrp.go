@@ -18,6 +18,8 @@ type Config struct {
 	AcceptIssuers []string
 	HTTPClient    *http.Client
 	ClockSkew     time.Duration
+	// Resource is the RFC 8707 resource indicator sent on the authorization, code and refresh requests; "" sends none.
+	Resource string
 }
 
 // Metadata is the part of the upstream IdP's discovery document the relying party uses (OIDC Discovery §3).
@@ -31,6 +33,7 @@ type Metadata struct {
 	IDTokenSigningAlgValues        []string `json:"id_token_signing_alg_values_supported"`
 	EndSessionEndpoint             string   `json:"end_session_endpoint"`
 	IntrospectionEndpoint          string   `json:"introspection_endpoint"`
+	RevocationEndpoint             string   `json:"revocation_endpoint"`
 }
 
 // AuthRequest is one sign-in attempt: the values kept on the browser until the callback, never sent to the client.
@@ -67,4 +70,17 @@ type IDToken struct {
 	SessionID string
 	// Raw is the compact ID token, the id_token_hint for an RP-initiated logout.
 	Raw string
+}
+
+// TokenSet is a validated token response (RFC 6749 Section 5.1).
+type TokenSet struct {
+	// IDToken is the verified ID token of a sign-in; nil after a refresh.
+	IDToken     *IDToken
+	AccessToken string
+	// RefreshToken is the one to use next: the new one, or the presented one when a refresh issued none (RFC 6749 Section 6).
+	RefreshToken string
+	// ExpiresAt is when the access token expires, from expires_in; zero when the response had none.
+	ExpiresAt time.Time
+	// Scopes are the granted scopes, or the requested ones when the response left scope out (RFC 6749 Section 5.1).
+	Scopes []string
 }
