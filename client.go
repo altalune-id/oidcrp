@@ -179,7 +179,10 @@ func (c *Client) redeem(ctx context.Context, meta *Metadata, code, verifier stri
 	if err != nil {
 		return nil, err
 	}
-	if out.IDToken == "" {
+	switch {
+	case !isBearer(out.TokenType):
+		return nil, &Error{Reason: ReasonTokenExchange, Err: errors.New("the token type is not Bearer")}
+	case out.IDToken == "":
 		return nil, &Error{Reason: ReasonTokenExchange, Err: errors.New("the token response has no id_token")}
 	}
 	return out, nil

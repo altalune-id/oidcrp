@@ -74,7 +74,7 @@ func (c *Client) RunLoopback(ctx context.Context, lc LoopbackConfig) (*TokenSet,
 	}()
 
 	if err := lc.Open(ctx, authURL); err != nil {
-		return nil, err
+		return nil, &Error{Reason: ReasonMisconfigured, Err: fmt.Errorf("open the authorization URL: %w", err)}
 	}
 	select {
 	case cb := <-got:
@@ -82,13 +82,16 @@ func (c *Client) RunLoopback(ctx context.Context, lc LoopbackConfig) (*TokenSet,
 		if err != nil {
 			return nil, err
 		}
-		set, err := run.tokenSet(out)
+		set, err := run.tokenSet(out, c.cfg.Scopes)
 		if err != nil {
 			return nil, err
 		}
 		set.IDToken = tok
 		return set, nil
 	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, &Error{Reason: ReasonCancelled, Err: ctx.Err()}
+		}
 		return nil, &Error{Reason: ReasonTimeout, Err: ctx.Err()}
 	}
 }
@@ -99,9 +102,9 @@ func loopbackRedirect(raw string) (*url.URL, error) {
 	if err != nil {
 		return nil, &Error{Reason: ReasonMisconfigured, Err: fmt.Errorf("the loopback redirect URI: %w", err)}
 	}
-	ip := net.ParseIP(u.Hostname())
-	if u.Scheme != "http" || ip == nil || !ip.IsLoopback() || u.Port() != "" || u.RawQuery != "" || u.Fragment != "" {
-		err := errors.New("the redirect URI must be http on a loopback IP with no port, query or fragment")
+	host := u.Hostname()
+	if u.Scheme != "http" || host != "127.0.0.1" && host != "::1" || u.User != nil || u.Port() != "" || u.RawQuery != "" || u.Fragment != "" {
+		err := errors.New("the redirect URI must be http on 127.0.0.1 or [::1] with no port, userinfo, query or fragment")
 		return nil, &Error{Reason: ReasonMisconfigured, Err: err}
 	}
 	if u.Path == "" {

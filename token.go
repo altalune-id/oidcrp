@@ -1,6 +1,7 @@
 package oidcrp
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,31 +23,38 @@ type tokenResponse struct {
 	IDToken      string          `json:"id_token"`
 }
 
-// Refresh redeems refreshToken for a new access token (RFC 6749 Section 6); an invalid_grant OAuthErrorOf means sign in again.
-func (c *Client) Refresh(ctx context.Context, refreshToken string) (*TokenSet, error) {
-	if refreshToken == "" {
+// Refresh renews prev through its refresh token (RFC 6749 Section 6); on an error with a non-nil set, store set.RefreshToken, the rotated one.
+func (c *Client) Refresh(ctx context.Context, prev TokenSet) (*TokenSet, error) {
+	if prev.RefreshToken == "" {
 		return nil, &Error{Reason: ReasonTokenExchange, Err: errors.New("no refresh token")}
 	}
 	meta, err := c.src.Metadata(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out, err := c.grant(ctx, meta, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refreshToken}})
+	out, err := c.grant(ctx, meta, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {prev.RefreshToken}})
 	if err != nil {
 		return nil, err
 	}
-	set, err := c.tokenSet(out)
+	rotated := cmp.Or(out.RefreshToken, prev.RefreshToken)
+	// SECURITY: RFC 9700 §4.14.2: the issuer has spent prev's refresh token, so a failed check still hands back the rotated one.
+	granted := prev.Scopes
+	if len(granted) == 0 {
+		granted = c.cfg.Scopes
+	}
+	set, err := c.tokenSet(out, granted)
 	if err != nil {
-		return nil, err
+		return &TokenSet{RefreshToken: rotated}, err
 	}
-	if set.RefreshToken == "" {
-		set.RefreshToken = refreshToken
-	}
+	set.RefreshToken = rotated
 	return set, nil
 }
 
 // Revoke asks the upstream IdP to revoke token (RFC 7009 Section 2.1); tokenTypeHint is access_token, refresh_token or "".
 func (c *Client) Revoke(ctx context.Context, token, tokenTypeHint string) error {
+	if token == "" {
+		return &Error{Reason: ReasonTokenExchange, Err: errors.New("no token")}
+	}
 	meta, err := c.src.Metadata(ctx)
 	if err != nil {
 		return err
@@ -78,9 +86,6 @@ func (c *Client) grant(ctx context.Context, meta *Metadata, form url.Values) (*t
 	if _, err := c.src.doJSON(r, ReasonTokenExchange, &out); err != nil {
 		return nil, err
 	}
-	if !strings.EqualFold(strings.TrimSpace(out.TokenType), "Bearer") {
-		return nil, &Error{Reason: ReasonTokenExchange, Err: errors.New("the token type is not Bearer")}
-	}
 	return &out, nil
 }
 
@@ -101,11 +106,14 @@ func (c *Client) clientRequest(ctx context.Context, endpoint string, form url.Va
 }
 
 // NOTE: RFC 6749 §5.1: access_token is required, expires_in is a positive integer when present, and scope replaces the requested scopes.
-func (c *Client) tokenSet(out *tokenResponse) (*TokenSet, error) {
-	if out.AccessToken == "" {
+func (c *Client) tokenSet(out *tokenResponse, granted []string) (*TokenSet, error) {
+	switch {
+	case !isBearer(out.TokenType):
+		return nil, &Error{Reason: ReasonTokenExchange, Err: errors.New("the token type is not Bearer")}
+	case out.AccessToken == "":
 		return nil, &Error{Reason: ReasonTokenExchange, Err: errors.New("the token response has no access_token")}
 	}
-	set := &TokenSet{AccessToken: out.AccessToken, RefreshToken: out.RefreshToken, Scopes: slices.Clone(c.cfg.Scopes)}
+	set := &TokenSet{AccessToken: out.AccessToken, RefreshToken: out.RefreshToken, Scopes: slices.Clone(granted)}
 	if scope := strings.Fields(out.Scope); len(scope) > 0 {
 		set.Scopes = scope
 	}
@@ -117,4 +125,8 @@ func (c *Client) tokenSet(out *tokenResponse) (*TokenSet, error) {
 		set.ExpiresAt = c.now().Add(time.Duration(n) * time.Second)
 	}
 	return set, nil
+}
+
+func isBearer(tokenType string) bool {
+	return strings.EqualFold(strings.TrimSpace(tokenType), "Bearer")
 }

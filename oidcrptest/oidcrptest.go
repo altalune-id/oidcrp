@@ -4,6 +4,8 @@ package oidcrptest
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -56,10 +58,12 @@ type signingKey struct {
 }
 
 type grant struct {
-	nonce    string
-	clientID string
-	scope    string
-	user     User
+	nonce       string
+	clientID    string
+	scope       string
+	challenge   string
+	redirectURI string
+	user        User
 }
 
 // Resources are the last RFC 8707 resource values the upstream IdP received.
@@ -127,7 +131,10 @@ func (f *IDP) Authorize(authURL string) url.Values {
 	q := u.Query()
 	code := rand.Text()
 	f.mu.Lock()
-	f.codes[code] = grant{nonce: q.Get("nonce"), clientID: q.Get("client_id"), scope: q.Get("scope"), user: f.User}
+	f.codes[code] = grant{
+		nonce: q.Get("nonce"), clientID: q.Get("client_id"), scope: q.Get("scope"), challenge: q.Get("code_challenge"),
+		redirectURI: q.Get("redirect_uri"), user: f.User,
+	}
 	f.resources.Authorize = q.Get("resource")
 	f.mu.Unlock()
 	return url.Values{"code": {code}, "state": {q.Get("state")}, "iss": {f.Issuer()}}
@@ -254,8 +261,31 @@ func (f *IDP) revoke(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.revocations++
+	if g, ok := f.refresh[r.PostFormValue("token")]; ok && clientOf(r) != g.clientID {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]string{"error": "unauthorized_client"})
+		return
+	}
 	delete(f.refresh, r.PostFormValue("token"))
 	w.WriteHeader(http.StatusOK)
+}
+
+// NOTE: RFC 7636 §4.6 and RFC 6749 §4.1.3: the verifier hashes to the challenge, and redirect_uri and client_id match the authorization.
+func (g grant) redeemedBy(r *http.Request) bool {
+	sum := sha256.Sum256([]byte(r.PostFormValue("code_verifier")))
+	return g.challenge != "" && base64.RawURLEncoding.EncodeToString(sum[:]) == g.challenge &&
+		r.PostFormValue("redirect_uri") == g.redirectURI && clientOf(r) == g.clientID
+}
+
+func clientOf(r *http.Request) string {
+	if user, _, ok := r.BasicAuth(); ok {
+		id, err := url.QueryUnescape(user)
+		if err != nil {
+			return ""
+		}
+		return id
+	}
+	return r.PostFormValue("client_id")
 }
 
 func merge(base, over map[string]any) map[string]any {
@@ -278,7 +308,7 @@ func (f *IDP) token(w http.ResponseWriter, r *http.Request) {
 	}
 	g, ok := f.codes[r.PostFormValue("code")]
 	delete(f.codes, r.PostFormValue("code"))
-	if f.TokenStatus != 0 || !ok || r.PostFormValue("code_verifier") == "" {
+	if f.TokenStatus != 0 || !ok || !g.redeemedBy(r) {
 		w.WriteHeader(max(f.TokenStatus, http.StatusBadRequest))
 		writeJSON(w, map[string]string{"error": "invalid_grant"})
 		return
@@ -299,7 +329,7 @@ func (f *IDP) token(w http.ResponseWriter, r *http.Request) {
 func (f *IDP) refreshGrant(w http.ResponseWriter, r *http.Request) {
 	g, ok := f.refresh[r.PostFormValue("refresh_token")]
 	delete(f.refresh, r.PostFormValue("refresh_token"))
-	if f.TokenStatus != 0 || !ok {
+	if f.TokenStatus != 0 || !ok || clientOf(r) != g.clientID {
 		w.WriteHeader(max(f.TokenStatus, http.StatusBadRequest))
 		writeJSON(w, map[string]string{"error": "invalid_grant"})
 		return

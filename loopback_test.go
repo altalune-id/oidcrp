@@ -140,6 +140,15 @@ func TestRunLoopback_StopsOnContext(t *testing.T) {
 		Open: func(context.Context, string) error { return nil },
 	})
 	assert.Equal(t, oidcrp.ReasonTimeout, oidcrp.ReasonOf(err))
+
+	cancelled, stop := context.WithCancel(t.Context())
+	_, err = nativeClient(idp, "http://127.0.0.1/callback").RunLoopback(cancelled, oidcrp.LoopbackConfig{
+		Open: func(context.Context, string) error {
+			stop()
+			return nil
+		},
+	})
+	assert.Equal(t, oidcrp.ReasonCancelled, oidcrp.ReasonOf(err), "the person stopped waiting")
 }
 
 func TestRunLoopback_OpenError(t *testing.T) {
@@ -149,6 +158,7 @@ func TestRunLoopback_OpenError(t *testing.T) {
 		Open: func(context.Context, string) error { return boom },
 	})
 	assert.ErrorIs(t, err, boom)
+	assert.Equal(t, oidcrp.ReasonMisconfigured, oidcrp.ReasonOf(err))
 }
 
 func TestRunLoopback_RefusesBadConfig(t *testing.T) {
@@ -159,6 +169,9 @@ func TestRunLoopback_RefusesBadConfig(t *testing.T) {
 		"http://127.0.0.1:8080/callback",
 		"http://192.168.1.10/callback",
 		"http://127.0.0.1/callback?x=1",
+		"http://user@127.0.0.1/callback",
+		"http://127.0.0.2/callback",
+		"http://[::ffff:127.0.0.1]/callback",
 		"https://app.example/callback",
 		"::not a url",
 	} {

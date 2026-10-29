@@ -65,7 +65,7 @@ func TestRefresh_RotatesWithTheTestIDP(t *testing.T) {
 	idp := oidcrptest.New(t)
 	c, set := signIn(t, idp)
 
-	next, err := c.Refresh(t.Context(), set.RefreshToken)
+	next, err := c.Refresh(t.Context(), *set)
 	require.NoError(t, err)
 	assert.Nil(t, next.IDToken, "OIDC Core §12.2: a refresh's ID token is not used")
 	assert.NotEmpty(t, next.AccessToken)
@@ -74,11 +74,11 @@ func TestRefresh_RotatesWithTheTestIDP(t *testing.T) {
 	_, claims := accessClaims(t, next.AccessToken)
 	assert.Equal(t, resource, claims["aud"])
 
-	_, err = c.Refresh(t.Context(), set.RefreshToken)
+	_, err = c.Refresh(t.Context(), *set)
 	assert.Equal(t, oidcrp.ReasonTokenExchange, oidcrp.ReasonOf(err))
 	assert.Equal(t, "invalid_grant", oidcrp.OAuthErrorOf(err), "RFC 6749 §5.2: a reused refresh token is invalid_grant")
 
-	_, err = c.Refresh(t.Context(), "")
+	_, err = c.Refresh(t.Context(), oidcrp.TokenSet{})
 	assert.Equal(t, oidcrp.ReasonTokenExchange, oidcrp.ReasonOf(err))
 }
 
@@ -89,6 +89,6 @@ func TestRevoke_WithTheTestIDP(t *testing.T) {
 	require.NoError(t, c.Revoke(t.Context(), set.RefreshToken, "refresh_token"))
 	require.NoError(t, c.Revoke(t.Context(), "unknown", ""), "RFC 7009 §2.2: an unknown token is still 200")
 	assert.Equal(t, 2, idp.Revocations())
-	_, err := c.Refresh(t.Context(), set.RefreshToken)
+	_, err := c.Refresh(t.Context(), *set)
 	assert.Equal(t, "invalid_grant", oidcrp.OAuthErrorOf(err), "RFC 7009 §2.1: a revoked refresh token is refused")
 }
