@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +63,9 @@ func (s *KeySource) Metadata(ctx context.Context) (*Metadata, error) {
 
 // SECURITY: OIDC Discovery §4.3, the document must name the configured issuer exactly, or it describes another upstream IdP.
 func (s *KeySource) fetchMetadata(ctx context.Context) (*Metadata, http.Header, error) {
+	if !secureIssuer(s.issuer) {
+		return nil, nil, &Error{Reason: ReasonMisconfigured, Err: errors.New("an http issuer must be on a loopback host")}
+	}
 	discovery := strings.TrimRight(s.issuer, "/") + "/.well-known/openid-configuration"
 	r, err := http.NewRequestWithContext(ctx, http.MethodGet, discovery, http.NoBody)
 	if err != nil {
@@ -191,6 +195,19 @@ func oauthError(status int, body []byte) string {
 func isTimeout(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// SECURITY: OIDC Discovery §3 and RFC 8414 §2: the issuer is https; plain http is only for a loopback issuer in development.
+func secureIssuer(issuer string) bool {
+	u, err := url.Parse(issuer)
+	if err != nil || u.Scheme != "http" {
+		return err == nil
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }
 
 func optionalSameScheme(issuer string, endpoints ...string) bool {

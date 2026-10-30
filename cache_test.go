@@ -79,3 +79,56 @@ func TestCache_CancelledCaller(t *testing.T) {
 }
 
 func at(t time.Time) func() time.Time { return func() time.Time { return t } }
+
+func TestCache_StaleCopyEndsOneCeilingPastExpiry(t *testing.T) {
+	c := cache[Metadata]{policy: ttlPolicy{floor: time.Minute, ceiling: time.Hour, fallback: time.Hour}}
+	good := &Metadata{Issuer: "https://id.example"}
+	ok := func(context.Context) (*Metadata, http.Header, error) { return good, nil, nil }
+	down := func(context.Context) (*Metadata, http.Header, error) {
+		return nil, nil, &Error{Reason: ReasonDiscovery, Err: errors.New("status 503")}
+	}
+	_, err := c.get(context.Background(), at(now), false, ok)
+	require.NoError(t, err)
+
+	got, err := c.get(context.Background(), at(now.Add(2*time.Hour-10*time.Second)), false, down)
+	require.NoError(t, err, "within one ceiling past expiry the last good copy is served")
+	assert.Same(t, good, got)
+
+	_, err = c.get(context.Background(), at(now.Add(2*time.Hour+time.Second)), false, down)
+	assert.Equal(t, ReasonDiscovery, ReasonOf(err), "past the stale limit it fails closed, even during the back-off")
+
+	_, err = c.get(context.Background(), at(now.Add(2*time.Hour+retryAfterFailure)), false, down)
+	assert.Equal(t, ReasonDiscovery, ReasonOf(err), "a later failed refetch fails closed too")
+
+	got, err = c.get(context.Background(), at(now.Add(2*time.Hour+2*retryAfterFailure)), false, ok)
+	require.NoError(t, err, "a good refetch recovers")
+	assert.Same(t, good, got)
+}
+
+func TestKeySource_HTTPIssuerOnlyOnLoopback(t *testing.T) {
+	var calls atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, errors.New("unreachable")
+	})}
+	_, err := NewKeySource("http://id.example", client).Metadata(context.Background())
+	assert.Equal(t, ReasonMisconfigured, ReasonOf(err), "OIDC Discovery §3: an issuer uses https")
+	assert.Zero(t, calls.Load(), "an http issuer off loopback is never fetched")
+
+	for issuer, want := range map[string]bool{
+		"https://id.example":      true,
+		"http://localhost:8080":   true,
+		"http://127.0.0.1:8080/p": true,
+		"http://[::1]:8080":       true,
+		"http://id.example":       false,
+		"http://127.0.0.2":        false,
+		"http://localhost.evil":   false,
+		"http://10.0.0.1":         false,
+	} {
+		assert.Equal(t, want, secureIssuer(issuer), issuer)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

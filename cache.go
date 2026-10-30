@@ -42,7 +42,7 @@ func (p ttlPolicy) of(h http.Header) time.Duration {
 	return min(max(ttl, p.floor), p.ceiling)
 }
 
-// NOTE: concurrent misses share one fetch made outside the lock, and a failed refetch serves the last good copy.
+// NOTE: concurrent misses share one fetch made outside the lock; a failed refetch serves the last good copy up to one ceiling past expiry.
 type cache[T any] struct {
 	policy  ttlPolicy
 	timeout time.Duration
@@ -60,12 +60,12 @@ func (c *cache[T]) get(
 ) (*T, error) {
 	now := clock()
 	c.mu.Lock()
-	val, failed, fresh, waiting := c.val, c.err, now.Before(c.expires), now.Before(c.retryAt)
+	val, failed, fresh, waiting, usable := c.val, c.err, now.Before(c.expires), now.Before(c.retryAt), c.usable(now)
 	c.mu.Unlock()
 	switch {
-	case val != nil && (fresh && !force || waiting):
+	case val != nil && (fresh && !force || waiting && usable):
 		return val, nil
-	case val == nil && waiting:
+	case waiting:
 		return nil, failed
 	}
 	ch := c.group.DoChan("", func() (any, error) {
@@ -96,7 +96,14 @@ func (c *cache[T]) store(now time.Time, v *T, h http.Header, err error) (*T, err
 		c.err, c.retryAt = err, now.Add(retryAfterEmptyFailure)
 		return nil, err
 	default:
-		c.retryAt = now.Add(retryAfterFailure)
+		c.err, c.retryAt = err, now.Add(retryAfterFailure)
+		if !c.usable(now) {
+			return nil, err
+		}
 	}
 	return c.val, nil
+}
+
+func (c *cache[T]) usable(now time.Time) bool {
+	return c.val != nil && now.Before(c.expires.Add(c.policy.ceiling))
 }

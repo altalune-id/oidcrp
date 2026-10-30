@@ -17,7 +17,7 @@ const (
 	ReasonIDToken       Reason = "id_token"
 	ReasonCancelled     Reason = "cancelled"
 	ReasonError         Reason = "error"
-	// ReasonMisconfigured is the deployment's fault, not the upstream IdP's: discovery names another issuer.
+	// ReasonMisconfigured is the deployment's fault, not the upstream IdP's: another discovery issuer, or http off loopback.
 	ReasonMisconfigured Reason = "misconfigured"
 )
 

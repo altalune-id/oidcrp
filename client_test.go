@@ -426,7 +426,7 @@ func TestCache_ServesStaleAndBacksOff(t *testing.T) {
 	require.Equal(t, 1, meta)
 	require.Equal(t, 1, jwks)
 
-	clock = clock.Add(25 * time.Hour)
+	clock = clock.Add(24*time.Hour + 10*time.Minute)
 	f.iss = "https://broken.example"
 	f.set(func() { f.jwksCode = http.StatusServiceUnavailable })
 	require.NoError(t, signIn(), "an upstream outage after the TTL still verifies with the last good copies")
