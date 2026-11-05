@@ -3,7 +3,7 @@ module github.com/altalune-id/oidcrp
 go 1.26.10
 
 require (
-	github.com/go-jose/go-jose/v4 v4.1.6
+	github.com/go-jose/go-jose/v4 v4.1.7
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/sync v0.24.0
 )
