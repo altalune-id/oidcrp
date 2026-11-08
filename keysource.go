@@ -21,6 +21,7 @@ type KeySource struct {
 	issuer string
 	http   *http.Client
 	now    func() time.Time
+	oauth  bool
 
 	meta *cache[Metadata]
 	keys *cache[jose.JSONWebKeySet]
@@ -50,6 +51,12 @@ func (s *KeySource) WithClock(now func() time.Time) *KeySource {
 	return s
 }
 
+// WithOAuthMetadata reads RFC 8414 authorization server metadata first, then OIDC discovery when the server publishes none.
+func (s *KeySource) WithOAuthMetadata() *KeySource {
+	s.oauth = true
+	return s
+}
+
 // Issuer is the issuer the source reads.
 func (s *KeySource) Issuer() string { return s.issuer }
 
@@ -61,28 +68,56 @@ func (s *KeySource) Metadata(ctx context.Context) (*Metadata, error) {
 	return s.meta.get(ctx, s.now, false, s.fetchMetadata)
 }
 
-// SECURITY: OIDC Discovery §4.3, the document must name the configured issuer exactly, or it describes another upstream IdP.
 func (s *KeySource) fetchMetadata(ctx context.Context) (*Metadata, http.Header, error) {
 	if !secureIssuer(s.issuer) {
 		return nil, nil, &Error{Reason: ReasonMisconfigured, Err: errors.New("an http issuer must be on a loopback host")}
 	}
-	discovery := strings.TrimRight(s.issuer, "/") + "/.well-known/openid-configuration"
+	if s.oauth {
+		meta, h, err := s.readMetadata(ctx, authorizationServerMetadataURL(s.issuer), false)
+		// NOTE: RFC 8414 §3.2: only a server that publishes no document (404) falls back; a bad document fails closed.
+		if !isStatus(err, http.StatusNotFound) {
+			return meta, h, err
+		}
+	}
+	return s.readMetadata(ctx, strings.TrimRight(s.issuer, "/")+"/.well-known/openid-configuration", true)
+}
+
+// SECURITY: OIDC Discovery §4.3 and RFC 8414 §3.3: the document must name the configured issuer exactly, or it describes another server.
+func (s *KeySource) readMetadata(ctx context.Context, discovery string, oidc bool) (*Metadata, http.Header, error) {
 	r, err := http.NewRequestWithContext(ctx, http.MethodGet, discovery, http.NoBody)
 	if err != nil {
 		return nil, nil, &Error{Reason: ReasonDiscovery, Err: err}
 	}
 	var meta Metadata
 	h, err := s.doJSON(r, ReasonDiscovery, &meta)
+	required := []string{meta.AuthorizationEndpoint, meta.TokenEndpoint}
+	optional := []string{meta.EndSessionEndpoint, meta.IntrospectionEndpoint, meta.RevocationEndpoint}
+	// NOTE: OIDC Discovery §3 requires jwks_uri; RFC 8414 §2 makes it optional, and an ID token without it fails at key lookup.
+	if oidc {
+		required = append(required, meta.JWKSURI)
+	} else {
+		optional = append(optional, meta.JWKSURI)
+	}
 	switch {
 	case err != nil:
 		return nil, nil, err
 	case meta.Issuer != s.issuer:
 		return nil, nil, &Error{Reason: ReasonMisconfigured, Err: errors.New("the discovery issuer does not match")}
-	case !sameScheme(s.issuer, meta.AuthorizationEndpoint, meta.TokenEndpoint, meta.JWKSURI),
-		!optionalSameScheme(s.issuer, meta.EndSessionEndpoint, meta.IntrospectionEndpoint, meta.RevocationEndpoint):
+	case !sameScheme(s.issuer, required...), !optionalSameScheme(s.issuer, optional...):
 		return nil, nil, &Error{Reason: ReasonDiscovery, Err: errors.New("an endpoint is missing or not on the issuer's scheme")}
 	}
 	return &meta, h, nil
+}
+
+// NOTE: RFC 8414 §3.1: the well-known suffix goes between the host and the issuer's path, with any terminating "/" removed.
+func authorizationServerMetadataURL(issuer string) string {
+	u, err := url.Parse(issuer)
+	if err != nil {
+		return issuer
+	}
+	u.Path = "/.well-known/oauth-authorization-server" + strings.TrimRight(u.Path, "/")
+	u.RawPath = ""
+	return u.String()
 }
 
 // Key returns the issuer's signing key kid. NOTE: OIDC Core §10.1.1: an unknown kid refetches the JWKS once, at most every 30 s.
@@ -168,9 +203,18 @@ func (s *KeySource) do(r *http.Request, reason Reason) (http.Header, []byte, err
 		return nil, nil, &Error{Reason: reason, Err: err}
 	case resp.StatusCode != http.StatusOK:
 		code := oauthError(resp.StatusCode, body)
-		return nil, nil, &Error{Reason: reason, OAuthError: code, Err: fmt.Errorf("status %d", resp.StatusCode)}
+		return nil, nil, &Error{Reason: reason, OAuthError: code, Err: statusError(resp.StatusCode)}
 	}
 	return resp.Header, body, nil
+}
+
+type statusError int
+
+func (e statusError) Error() string { return fmt.Sprintf("status %d", int(e)) }
+
+func isStatus(err error, status int) bool {
+	var se statusError
+	return errors.As(err, &se) && int(se) == status
 }
 
 // NOTE: RFC 6749 §5.2 codes plus RFC 8707's invalid_target and RFC 7009 §2.2.1's unsupported_token_type.

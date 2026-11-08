@@ -54,7 +54,11 @@ func New(cfg Config) *Client {
 	if cfg.ClockSkew <= 0 {
 		cfg.ClockSkew = defaultClockSkew
 	}
-	return &Client{cfg: cfg, src: NewKeySource(cfg.Issuer, cfg.HTTPClient)}
+	src := NewKeySource(cfg.Issuer, cfg.HTTPClient)
+	if cfg.OAuthMetadata {
+		src.WithOAuthMetadata()
+	}
+	return &Client{cfg: cfg, src: src}
 }
 
 // WithClock replaces the clock, for tests.
@@ -130,27 +134,37 @@ func (c *Client) Exchange(ctx context.Context, cb Callback, req AuthRequest) (*I
 	return tok, err
 }
 
-func (c *Client) exchange(ctx context.Context, cb Callback, req AuthRequest) (*tokenResponse, *IDToken, error) {
-	if req.State == "" || subtle.ConstantTimeCompare([]byte(cb.State), []byte(req.State)) != 1 {
-		return nil, nil, &Error{Reason: ReasonState, Err: errors.New("state does not match")}
+// ExchangeTokens checks the callback and redeems the code for a TokenSet; IDToken is verified when openid was requested, else nil.
+func (c *Client) ExchangeTokens(ctx context.Context, cb Callback, req AuthRequest) (*TokenSet, error) {
+	meta, err := c.checkCallback(ctx, cb, req)
+	if err != nil {
+		return nil, err
 	}
-	meta, err := c.src.Metadata(ctx)
+	out, err := c.grant(ctx, meta, c.codeForm(cb.Code, req.CodeVerifier))
+	if err != nil {
+		return nil, err
+	}
+	set, err := c.tokenSet(out, c.cfg.Scopes)
+	if err != nil {
+		return nil, err
+	}
+	// NOTE: OIDC Core §3.1.3.3: an openid request gets an ID token; a plain OAuth grant (RFC 6749 §5.1) has none to verify.
+	if !slices.Contains(c.cfg.Scopes, "openid") {
+		return set, nil
+	}
+	if out.IDToken == "" {
+		return nil, &Error{Reason: ReasonTokenExchange, Err: errors.New("the token response has no id_token")}
+	}
+	if set.IDToken, err = c.verify(ctx, meta, out.IDToken, req.Nonce); err != nil {
+		return nil, err
+	}
+	return set, nil
+}
+
+func (c *Client) exchange(ctx context.Context, cb Callback, req AuthRequest) (*tokenResponse, *IDToken, error) {
+	meta, err := c.checkCallback(ctx, cb, req)
 	if err != nil {
 		return nil, nil, err
-	}
-	// SECURITY: RFC 9207 §2.4: a present iss must name the upstream IdP, or it is a mix-up; a code needs iss when it is advertised.
-	// SECURITY: Google interop: Google omits iss on error responses; an error with no code and no iss has nothing to inject or steal.
-	missing := cb.Issuer == "" && meta.AuthorizationResponseISSParams && (cb.Code != "" || cb.Error == "")
-	if missing || cb.Issuer != "" && cb.Issuer != meta.Issuer {
-		return nil, nil, &Error{Reason: ReasonIssuer, Err: errors.New("the authorization response iss does not match")}
-	}
-	switch {
-	case cb.Error == "access_denied":
-		return nil, nil, &Error{Reason: ReasonCancelled, Err: errors.New("access_denied")}
-	case cb.Error != "":
-		return nil, nil, &Error{Reason: ReasonError, Err: errors.New("the upstream IdP answered " + errorCode(cb.Error))}
-	case cb.Code == "":
-		return nil, nil, &Error{Reason: ReasonState, Err: errors.New("no code")}
 	}
 	out, err := c.redeem(ctx, meta, cb.Code, req.CodeVerifier)
 	if err != nil {
@@ -163,6 +177,31 @@ func (c *Client) exchange(ctx context.Context, cb Callback, req AuthRequest) (*t
 	return out, tok, nil
 }
 
+func (c *Client) checkCallback(ctx context.Context, cb Callback, req AuthRequest) (*Metadata, error) {
+	if req.State == "" || subtle.ConstantTimeCompare([]byte(cb.State), []byte(req.State)) != 1 {
+		return nil, &Error{Reason: ReasonState, Err: errors.New("state does not match")}
+	}
+	meta, err := c.src.Metadata(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// SECURITY: RFC 9207 §2.4: a present iss must name the upstream IdP, or it is a mix-up; a code needs iss when it is advertised.
+	// SECURITY: Google interop: Google omits iss on error responses; an error with no code and no iss has nothing to inject or steal.
+	missing := cb.Issuer == "" && meta.AuthorizationResponseISSParams && (cb.Code != "" || cb.Error == "")
+	if missing || cb.Issuer != "" && cb.Issuer != meta.Issuer {
+		return nil, &Error{Reason: ReasonIssuer, Err: errors.New("the authorization response iss does not match")}
+	}
+	switch {
+	case cb.Error == "access_denied":
+		return nil, &Error{Reason: ReasonCancelled, Err: errors.New("access_denied")}
+	case cb.Error != "":
+		return nil, &Error{Reason: ReasonError, Err: errors.New("the upstream IdP answered " + errorCode(cb.Error))}
+	case cb.Code == "":
+		return nil, &Error{Reason: ReasonState, Err: errors.New("no code")}
+	}
+	return meta, nil
+}
+
 // NOTE: the error parameter is attacker-controlled and unbounded, so only a registered code reaches a log line.
 func errorCode(code string) string {
 	if slices.Contains(knownErrors, code) {
@@ -172,10 +211,7 @@ func errorCode(code string) string {
 }
 
 func (c *Client) redeem(ctx context.Context, meta *Metadata, code, verifier string) (*tokenResponse, error) {
-	form := url.Values{
-		"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {c.cfg.RedirectURI}, "code_verifier": {verifier},
-	}
-	out, err := c.grant(ctx, meta, form)
+	out, err := c.grant(ctx, meta, c.codeForm(code, verifier))
 	if err != nil {
 		return nil, err
 	}
@@ -186,6 +222,12 @@ func (c *Client) redeem(ctx context.Context, meta *Metadata, code, verifier stri
 		return nil, &Error{Reason: ReasonTokenExchange, Err: errors.New("the token response has no id_token")}
 	}
 	return out, nil
+}
+
+func (c *Client) codeForm(code, verifier string) url.Values {
+	return url.Values{
+		"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {c.cfg.RedirectURI}, "code_verifier": {verifier},
+	}
 }
 
 // IsAccessTokenType reports whether a JWS header's typ is RFC 9068's at+jwt or application/at+jwt, compared case-insensitively.
