@@ -20,6 +20,8 @@ type Config struct {
 	ClockSkew     time.Duration
 	// Resource is the RFC 8707 resource indicator sent on the authorization, code and refresh requests; "" sends none.
 	Resource string
+	// OAuthMetadata reads RFC 8414 authorization server metadata first, then OIDC discovery when the server publishes none.
+	OAuthMetadata bool
 }
 
 // Metadata is the part of the upstream IdP's discovery document the relying party uses (OIDC Discovery §3).
