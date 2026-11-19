@@ -8,6 +8,6 @@ Rules for anyone changing this repo, people and coding agents alike.
 - Gates: `go test -race ./...` and `golangci-lint run`, the same as CI.
 - Comments: none by default; exported symbols get a one-sentence doc; keep only markers (`TODO`, `NOTE`, `SECURITY`) or links.
 - Conventional Commits, one line; every commit is signed.
-- No AI attribution in commits, PRs or files.
 - Never weaken a lint or check to get green.
 - Never reference untracked files or IDs defined only in them.
+- Shared skills come from the `altalune` Claude Code plugin marketplace (`altalune-id/agent-plugins`), enabled in `.claude/settings.json`.
